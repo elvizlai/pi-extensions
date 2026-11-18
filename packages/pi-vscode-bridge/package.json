@@ -1,0 +1,57 @@
+{
+  "name": "@tian.zuo/pi-vscode-bridge",
+  "version": "0.1.0",
+  "description": "Deprecated: send file, line, and diff-hunk references from VS Code into a running pi agent's input editor. Retained for historical reference; no longer recommended or actively developed.",
+  "type": "module",
+  "private": true,
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "vscode"
+  ],
+  "author": "Tian Zuo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TianZuo555/pi-extensions.git",
+    "directory": "packages/pi-vscode-bridge"
+  },
+  "homepage": "https://github.com/TianZuo555/pi-extensions#pi-vscode-bridge",
+  "bugs": {
+    "url": "https://github.com/TianZuo555/pi-extensions/issues"
+  },
+  "files": [
+    "index.ts",
+    "lib",
+    "src",
+    "vscode/package.json",
+    "vscode/out"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "effect": "4.1.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@effect/language-service": "^0.87.5",
+    "@types/node": "^26.6.6",
+    "@types/vscode": "^1.140.0",
+    "typescript": "^7.0.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

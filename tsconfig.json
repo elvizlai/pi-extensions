@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "plugins": [{ "name": "@effect/language-service" }]
+  },
+  "include": ["extensions/**/*.ts", "packages/**/*.ts", "scripts/**/*.ts"],
+  "exclude": [
+    "packages/pi-edit-safe/**",
+    "packages/pi-goal/**",
+    "packages/pi-subagents/**",
+    "packages/pi-todo/**",
+    "packages/pi-vscode-bridge/**",
+    "extensions/edit-safe.ts",
+    "extensions/goal.ts",
+    "extensions/subagents.ts",
+    "extensions/todo.ts",
+    "extensions/vscode-bridge.ts"
+  ]
+}

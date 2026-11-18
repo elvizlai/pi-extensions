@@ -1,0 +1,79 @@
+# @tian.zuo/pi-ask-user
+
+Release notes: [changelog](https://github.com/TianZuo555/pi-extensions/blob/main/packages/pi-ask-user/CHANGELOG.md) · [GitHub releases](https://github.com/TianZuo555/pi-extensions/releases)
+
+Let the model ask you a multiple-choice question from [pi](https://pi.dev).
+
+> **Token-light by design.** The entire model-facing surface — tool description, schema docs, and three guideline bullets — totals **≈560 characters**. The most-downloaded alternative `ask_user` package ([@eko24ive/pi-ask](https://www.npmjs.com/package/@eko24ive/pi-ask)) spends ≈1,700 on its tool description and schema alone, and popular pi extensions generally run 2–3k (pi-mcp-adapter: ≈2.5k across 12 tools; pi-web-access: ≈3.2k on `web_search` alone). Same interactive form, a third of the prompt weight — the wording lives in one small `lib/prompt.ts` instead of prose sprayed through the schema.
+
+```bash
+pi install npm:@tian.zuo/pi-ask-user
+```
+
+Registers an `ask_user` tool. The model can supply 1–5 questions with 2–5
+options each. Questions and option descriptions wrap across as many lines as
+needed instead of being truncated. Every question accepts one selection and
+also gets a free-form **Other** option. The model is instructed to order each
+question's options with its recommendation first, and the selected answer is
+marked with a `→` arrow — single-selection list style, not a checkbox. A
+model-supplied Other-style option is refused rather than shown twice: the
+duplicate would otherwise reach the user with nothing reporting it back.
+
+TUI form controls (other modes use pi's built-in dialogs):
+
+- `1`–`6` — pick the option with that number and advance to the next question,
+  or submit when the form is complete. The last number is the **Other** row:
+  it opens the custom-answer editor instead
+- `←` / `→` — switch questions while preserving answers
+- `↑` / `↓` — move between options
+- `Space` — select an option
+- `Enter` — move to the next question or submit the completed form
+- `Esc` — go back from the custom-answer editor or dismiss the form
+
+While it waits for your answer, the tool reports the input requirement on pi's
+**shared event bus** (`pi.events`). This is pi's in-process mechanism for tool ↔
+integration communication: an integration subscribes with `pi.events.on(...)`,
+aggregates active requests into its own agent state, and bridges that state to
+its client.
+
+The same versioned payload goes out on two channels. `herdr:blocked` is the one
+with a live consumer: [Herdr](https://herdr.dev)'s shipped pi integration (v8 in
+Herdr 0.9.0, still v9 upstream) subscribes to it, maps `active`/`label` onto the
+pane's blocked state, and owns the resulting status and needs-attention
+notification. `agent:input_required` mirrors that payload under a
+client-agnostic name for consumers that prefer one; nothing subscribes to it
+yet, so the two channels coexist rather than one deprecating the other. The
+stable `id` lets consumers correlate duplicate and concurrent requests:
+
+```ts
+{
+  version: 1,
+  id: string,        // ask_user tool-call ID
+  source: "ask_user",
+  active: boolean,   // true before waiting, false in finally
+  label: string      // normalized question, always present
+}
+```
+
+In the TUI, the form also reports `blocked` (`kind=question`, with the label as
+the message) through the terminal's OSC 7501 program status. Terminals such as
+[Rex](https://www.superlogical.com/rex/docs/build/program-status) show it on the
+tab and the session picker. Pi reports `blocked` only for its built-in
+`select`/`input`/`editor` dialogs, not for `ctx.ui.custom()` forms, so the tool
+reports it itself. When the form closes, it restores the `working` status that
+Pi reported for the run. Pi writes nothing when the terminal does not support
+OSC 7501.
+
+Pi's event bus has no "blocked" status (only *working* while a tool call is in
+flight vs *idle*), and can't distinguish an autonomous long-running tool from
+one waiting on a human. Pi 0.84.4+ emits its own `ui_prompt_start` /
+`ui_prompt_end` around `ctx.ui` prompts, but those carry no question label for
+`custom` forms — the shape this tool renders. Emitting is best-effort, balanced
+active→inactive via `try/finally`, and a harmless no-op when nothing listens. No
+event is emitted in non-UI modes.
+
+See the [collection repository](https://github.com/TianZuo555/pi-extensions) for more extensions.
+
+## License
+
+[MIT](../../LICENSE) © Tian Zuo

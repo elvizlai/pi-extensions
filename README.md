@@ -1,0 +1,127 @@
+# pi-tian-extensions
+
+A collection of independent extensions for the [pi coding agent](https://pi.dev),
+published as npm packages from a pnpm workspace monorepo.
+
+Each extension has its own package and its own README under
+[`packages/`](packages/) — this file is only an index.
+
+## Extensions
+
+| Package | Commands / Tools | What it does |
+|---|---|---|
+| [pi-repo-model](packages/pi-repo-model/README.md) | `/repo-model`, `/repo-model-unset`, `/repo-model-list` | Per-repo default model + thinking level, auto-applied at session start. |
+| [pi-repo-skills](packages/pi-repo-skills/README.md) | `/skills`, `/skills-list`, `/skills-reset` | Per-repo skill toggles via checkbox TUI; disabled skills leave the prompt. |
+| [pi-commit](packages/pi-commit/README.md) | `/commit`, `/commit-all` | Git commits written by a separately configured model. |
+| [pi-token-speed](packages/pi-token-speed/README.md) | `/tps` | Live tok/s meter in the footer plus an end-of-message summary. |
+| [pi-image-cache](packages/pi-image-cache/README.md) | `Ctrl+V`, `/images`, `/image-cache-clear` | Caches pasted images as `[Image#NNN]` and re-attaches them on send. |
+| [pi-ask-user](packages/pi-ask-user/README.md) | tool `ask_user` | Lets the model ask 1–5 single-choice questions in one form. |
+| [pi-usage](packages/pi-usage/README.md) | `/usage`, `/tokens` | Provider account usage (OpenAI via legacy Codex login, Copilot, Z.ai, DeepSeek, Xiaomi MiMo) plus a token/cost dashboard. |
+| [pi-background-terminals](packages/pi-background-terminals/README.md) | `/ps`, overrides tool `bash` | One no-stdin bash path: long commands yield to background and notify once. |
+| [pi-edit-safe (deprecated)](packages/pi-edit-safe/README.md) | overrides tool `edit` | Historical stricter edit override; use Pi’s built-in `edit` tool. |
+| [pi-find](packages/pi-find/README.md) | overrides tools `grep`/`find` | Simple, bounded regex and file-glob search. |
+| [pi-subagents (deprecated)](packages/pi-subagents/README.md) | tool `subagent`, `/agents` | Historical isolated subagent runs; no longer recommended or actively developed. |
+| [pi-beautify-style](packages/pi-beautify-style/README.md) | `/ccstyle`, `/context`, `@` | Claude Code-style TUI: tool cards, rich diffs, compact mode, footer chips. Integrates this repo's `ask_user`, background terminals, and usage. |
+| [pi-goal (deprecated)](packages/pi-goal/README.md) | `/goal`, tools `get_goal`/`update_goal` | Historical goal-mode loop; no longer recommended or actively developed. |
+| [pi-todo (deprecated)](packages/pi-todo/README.md) | tool `todo` | Historical session-local checklist; prefer model-managed plans for simple work. |
+| [pi-web-search](packages/pi-web-search/README.md) | tools `web_search`/`web_fetch`, `/websearch-order` | Web search and fetch with tabbed fallback-order configuration across ten providers plus direct fetch. |
+| [pi-antigravity](packages/pi-antigravity/README.md) | `/agy`, `/agy-tasks`, `/agy-artifacts`, `/agy-usage` | Google Antigravity (`agy`) models inside pi via stream-json RPC. |
+| [pi-vscode-bridge (deprecated)](packages/pi-vscode-bridge/README.md) | `/vscode-connect` | Historical VS Code ref bridge; no longer recommended or actively developed. |
+| [pi-compact](packages/pi-compact/README.md) | intercepts `/compact` | GPT-6 Luna compaction: opaque Codex checkpoints or text summaries for new OpenAI OAuth. |
+| [pi-rex](packages/pi-rex/README.md) | system prompt section `<rex>` | Tells pi its Rex session and pane at session start, like the Rex hook for Claude Code and Codex. Names the Rex session and tab from the first prompt. Records each pane's pi session so a shell hook resumes pi after a Rex restart. |
+| [pi-devin-acp](packages/pi-devin-acp/README.md) | models `devin/*`, `/devin`, `/devin-<sub>` | Devin models inside pi by driving the Devin CLI as an ACP server. |
+
+## Install
+
+The extensions are published as independent npm packages — install only the
+ones you need:
+
+```bash
+pi install npm:@tian.zuo/pi-commit
+pi install npm:@tian.zuo/pi-background-terminals
+```
+
+Restart pi or run `/reload` after installation. Try an extension temporarily
+without adding it to settings:
+
+```bash
+pi -e npm:@tian.zuo/pi-image-cache
+```
+
+Update installed extensions and reload:
+
+```bash
+pi update --extensions
+```
+
+Remove one independently:
+
+```bash
+pi remove npm:@tian.zuo/pi-token-speed
+```
+
+## Development
+
+The repository is a pnpm workspace with one package per extension under
+`packages/`.
+
+```bash
+pnpm install
+pnpm run typecheck   # TypeScript across all workspaces
+pnpm run check       # Effect checks
+pnpm test            # extension test suites (deprecated packages excluded)
+```
+
+The deprecated `pi-todo`, `pi-subagents`, `pi-edit-safe`, `pi-goal`, and
+`pi-vscode-bridge` packages remain as reference source but are excluded from
+the pnpm workspace. CI does not install or audit dependencies used only by
+these packages, run their package checks or tests, pack them, or publish them.
+The root TypeScript check also excludes their source and legacy re-export stubs. The root package does
+not load them; `pi-vscode-bridge` is not packaged as a VS Code extension.
+
+`pnpm run lint` excludes the same five packages. When you deprecate another
+package, update the exclusions in `pnpm-workspace.yaml`, `tsconfig.json`, and
+`biome.json`.
+
+Try a single extension from a checkout:
+
+```bash
+pi -e ./packages/pi-repo-model
+```
+
+Extensions import pi's runtime packages (`@earendil-works/*`, `typebox`) as
+**peer dependencies** — pi provides them at runtime; they are never bundled.
+
+## Publishing
+
+Releases use [Changesets](https://github.com/changesets/changesets). For every
+publishable extension change, run `pnpm changeset`, select the package and
+semantic version bump, and commit the generated release-note file. Do not bump
+package versions manually.
+
+Two workflows automate quality and delivery. [`CI`](.github/workflows/ci.yml)
+runs on every pull request and push to `main`: typecheck, Effect checks, lint,
+and a packing dry run on Ubuntu, plus the full test suite on Ubuntu, Windows,
+and macOS. Make its `CI` summary job a required status check on `main`.
+
+On pushes to `main`, [`Release`](.github/workflows/release.yml) reuses that same
+CI workflow as a gate and then opens or updates a release PR. Merging that PR
+publishes each changed package to npm, updates its package-specific
+`CHANGELOG.md`, and creates a separate tagged GitHub release. npm trusted
+publishing supplies OIDC provenance without a token secret. The workflow can
+also be run manually from *Actions → Release* in dry-run mode to preview pending
+releases. The repository must allow GitHub Actions to create pull requests under
+*Settings → Actions → General → Workflow permissions*.
+
+The release PR is created with the default `GITHUB_TOKEN`, so it never triggers
+`pull_request` CI — that is why `Release` runs the checks itself instead of
+relying on the PR's status.
+
+```bash
+pnpm changeset          # add release notes for changed packages
+pnpm changeset:status   # inspect pending releases
+```
+
+## License
+
+[MIT](./LICENSE) © Tian Zuo
