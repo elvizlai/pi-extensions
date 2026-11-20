@@ -68,7 +68,7 @@ export type AgyActivity =
       tokens: number;
       durationSeconds?: number;
     }
-  | { type: "usage"; usage: AgyUsage }
+  | { type: "usage"; usage: AgyUsage; durationSeconds?: number }
   | {
       /** Terminal status, already normalized: anything agy did not explicitly
        * report as successful arrives as "ERROR". */
@@ -203,8 +203,14 @@ export function applyEvent(outcome: AgyTurnOutcome, event: ParsedAgyEvent): AgyA
         }
         if (step.usage) {
           // Running per-response usage; the result event carries the totals.
+          const durationSeconds =
+            typeof step.duration_seconds === "number" ? step.duration_seconds : undefined;
           outcome.usage = step.usage;
-          activities.push({ type: "usage", usage: step.usage });
+          activities.push({
+            type: "usage",
+            usage: step.usage,
+            ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+          });
           const thoughtTokens = step.usage.thinking_tokens;
           if (
             step.state === "DONE" &&
@@ -214,8 +220,7 @@ export function applyEvent(outcome: AgyTurnOutcome, event: ParsedAgyEvent): AgyA
             activities.push({
               type: "thought",
               tokens: thoughtTokens,
-              durationSeconds:
-                typeof step.duration_seconds === "number" ? step.duration_seconds : undefined,
+              durationSeconds,
             });
           }
         }

@@ -65,6 +65,14 @@ test("formatAgyCall covers orchestration and media tools", () => {
     'send_message researcher "status?"',
   );
   assert.equal(formatAgyCall("manage_task", { Action: "list" }, theme), "manage_task list");
+  assert.equal(
+    formatAgyCall("exit_plan_mode", { plan: "# Fix bridge lifecycle\n1. Step one" }, theme),
+    'exit_plan_mode "Fix bridge lifecycle"',
+  );
+  assert.equal(
+    formatAgyCall("enter_plan_mode", { reason: "Step 2 failed twice" }, theme),
+    'enter_plan_mode "Step 2 failed twice"',
+  );
   // Unknown shapes fall back to a bounded key/value summary, not raw JSON.
   const generic = formatAgyCall("schedule", { cron: "* * * * *", prompt: "run tests" }, theme);
   assert.match(generic, /schedule/);

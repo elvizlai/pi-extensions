@@ -17,7 +17,7 @@ import { trackActiveToolStep } from "./tool-steps.ts";
 import { applyEvent, newTurnOutcome, type AgyActivity, type AgyTurnOutcome } from "./reducer.ts";
 
 /** agy reasoning effort, as accepted by `agy --effort`. */
-export type AgyEffort = "low" | "medium" | "high";
+export type AgyEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface AgyTurnRequest {
   prompt: string;
@@ -69,6 +69,8 @@ export interface AgyTurnRequest {
   onConversation?: (conversationId: string) => void;
   /** Called when the driver confirms off-stream tool liveness so the caller can slide its turn deadline. */
   onLiveness?: () => void;
+  /** True while Pi owns execution of bridged MCP tool call(s) awaited by this agy turn. */
+  hasPendingBridgeCalls?: () => boolean;
   /** Test seam: replaces the spawned binary. */
   spawnOverride?: typeof spawn;
 }
@@ -227,15 +229,28 @@ export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcom
     // Stall watchdog: any stdout/stderr bytes count as liveness (chunk level,
     // not parsed events — unknown shapes must still reset the timer). A tool
     // step that is legitimately quiet gets the longer tool budget.
-    const stallBaseMs = request.inactivityTimeoutMs ?? 120_000;
+    const stallBaseMs = request.inactivityTimeoutMs ?? 300_000;
     const stallToolMs = request.toolInactivityTimeoutMs ?? Math.max(stallBaseMs, 300_000);
     let rearmStall: () => void = () => {};
     if (stallBaseMs > 0) {
+      let waitingOnBridge = false;
       const armStall = () => {
         if (settled || outcome.finished) return;
         if (stallTimer !== undefined) clearTimeout(stallTimer);
         const budgetMs = activeTools.size > 0 ? stallToolMs : stallBaseMs;
         stallTimer = setTimeout(() => {
+          if (request.hasPendingBridgeCalls?.()) {
+            waitingOnBridge = true;
+            request.onLiveness?.();
+            armStall();
+            return;
+          }
+          if (waitingOnBridge) {
+            waitingOnBridge = false;
+            request.onLiveness?.();
+            armStall();
+            return;
+          }
           killAgyTree(child);
           untrack();
           finishLogical(() => {
@@ -243,10 +258,14 @@ export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcom
           });
         }, budgetMs);
       };
-      rearmStall = armStall;
+      const resetStall = () => {
+        waitingOnBridge = false;
+        armStall();
+      };
+      rearmStall = resetStall;
       armStall();
-      child.stdout?.on("data", armStall);
-      child.stderr?.on("data", armStall);
+      child.stdout?.on("data", resetStall);
+      child.stderr?.on("data", resetStall);
     }
 
     abortHandler = () => {

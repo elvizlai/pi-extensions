@@ -10,7 +10,12 @@
 
 import type { JsonObject } from "@earendil-works/pi-ai";
 import { Context, Data, Effect, Layer, ManagedRuntime, Exit, Cause, Result } from "effect";
-import { AgySpawnError, AgyStallError, type AgyTurnRequest } from "../lib/agy-client.ts";
+import {
+  AgySpawnError,
+  AgyStallError,
+  type AgyEffort,
+  type AgyTurnRequest,
+} from "../lib/agy-client.ts";
 import {
   createAgyTurnExecutor,
   type AgyExecutorSnapshot,
@@ -120,15 +125,18 @@ export interface AntigravityRuntimeShape {
      */
     readonly bootstrapSuffix?: string;
     readonly modelId: string;
-    readonly effort?: "low" | "medium" | "high";
+    readonly effort?: AgyEffort;
     readonly agent?: string;
     readonly mode?: AgyExecutionMode;
     readonly mcpDirectory?: string;
     readonly bridgeRevision?: string;
+    readonly hasPendingBridgeCalls?: () => boolean;
     readonly signal?: AbortSignal;
   }) => Effect.Effect<AgyTurnController, AntigravityRuntimeClosedError>;
   /** Clear the active controller once a provider turn reached a terminal state. */
   readonly finishTurn: Effect.Effect<void>;
+  /** Reap any orphaned in-flight turn left after a Pi run settles without re-attaching. */
+  readonly abandonTurn: Effect.Effect<void, AntigravityRuntimeClosedError>;
   /**
    * Route a bridged agy MCP call into the live turn controller as a
    * synthetic bridge_call activity. Returns false when no turn is active
@@ -178,6 +186,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
     let activeTurnCompletion: Promise<void> | undefined;
     /** Aborts the in-flight agy child process when the runtime closes. */
     let activeTurnAbort: AbortController | undefined;
+    let activeRefreshDeadline: (() => void) | undefined;
     let generation = 0;
     // The first agy turn may follow work with another provider. Only an
     // explicit reset suppresses history on a fresh conversation.
@@ -190,6 +199,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
       generation += 1;
       activeTurnAbort?.abort();
       activeTurnAbort = undefined;
+      activeRefreshDeadline = undefined;
       activeTurnCompletion = undefined;
       active = undefined;
     };
@@ -270,12 +280,20 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
               if (closed) throw new Error("antigravity runtime is shut down.");
               if (
                 active &&
+                model === request.modelId &&
                 active.prompt === request.prompt &&
                 (!active.isClosed() || active.hasPending())
               ) {
+                activeRefreshDeadline?.();
+                executor.notifyActivity?.();
                 return active;
               }
-              if (active) invalidateActiveTurn();
+              if (active) {
+                await recycle(
+                  "recycle",
+                  model !== undefined && model !== request.modelId ? "model" : undefined,
+                );
+              }
               // agy pins a conversation to the workspace it was created in:
               // resuming it from another directory silently writes into the
               // OLD workspace (verified 2026-08-21) or rejects writes with
@@ -345,6 +363,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 deadlineTimer = setTimeout(() => turnAbort.abort(timeoutError), timeoutMs);
               };
               refreshTurnDeadline();
+              activeRefreshDeadline = refreshTurnDeadline;
               let onTurnAbort!: () => void;
               const cancelled = new Promise<never>((_resolve, reject) => {
                 onTurnAbort = () => reject(abortFailure());
@@ -389,9 +408,10 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 bridgeRevision: request.bridgeRevision,
                 cwd,
                 timeoutMs,
-                inactivityTimeoutMs: envInt("AGY_STALL_TIMEOUT_MS", 120_000),
+                inactivityTimeoutMs: envInt("AGY_STALL_TIMEOUT_MS", 300_000),
                 toolInactivityTimeoutMs: envInt("AGY_TOOL_STALL_TIMEOUT_MS", 300_000),
                 parkedWatchMs: envInt("AGY_PARKED_WATCH_MS", 5_000),
+                hasPendingBridgeCalls: request.hasPendingBridgeCalls,
                 signal: turnAbort.signal,
                 onConversation: (id) => {
                   if (turnGeneration !== generation || turnAbort.signal.aborted) return;
@@ -573,6 +593,9 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                     request.signal?.removeEventListener("abort", requestAbortHandler);
                   }
                   if (activeTurnAbort === turnAbort) activeTurnAbort = undefined;
+                  if (activeRefreshDeadline === refreshTurnDeadline) {
+                    activeRefreshDeadline = undefined;
+                  }
                 });
               return controller;
             }),
@@ -582,8 +605,17 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
       finishTurn: Effect.sync(() => {
         // Called only when Pi has consumed the final result (or an error),
         // never for the toolUse handoff that must keep this controller alive.
+        activeRefreshDeadline = undefined;
         active = undefined;
       }),
+
+      abandonTurn: ensureOpen.pipe(
+        Effect.andThen(
+          Effect.promise(async () => {
+            if (active) await recycle("abort");
+          }),
+        ),
+      ),
 
       pushBridgeCall: (call) => {
         if (closed || !active || active.isClosed()) return false;

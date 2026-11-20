@@ -68,6 +68,7 @@ interface ImagePart {
  */
 function latestUserBatch(context: TranscriptContext): {
   start: number;
+  end: number;
   prompt: string;
   images: number;
 } {
@@ -95,11 +96,12 @@ function latestUserBatch(context: TranscriptContext): {
     const prompt = texts.join("\n");
     return {
       start: i,
+      end,
       prompt: prompt + (images ? `\n${omittedImagesPrompt(images)}` : ""),
       images,
     };
   }
-  return { start: -1, prompt: "", images: 0 };
+  return { start: -1, end: -1, prompt: "", images: 0 };
 }
 
 /** Extract all text in the latest user batch (plus an image-omitted note). */
@@ -114,37 +116,47 @@ export function latestUserPrompt(context: TranscriptContext): { prompt: string; 
 // forks, stale/missing conversations, and branch moves.
 const MAX_RESTORED_HISTORY_CHARS = 80_000;
 
-/** Serialize the active pi branch before its latest user request. */
+/** Serialize the active pi branch before its latest user request (plus completed in-turn steps if starting fresh mid-turn). */
 export function piHistoryBootstrap(context: TranscriptContext): string | undefined {
-  const { start: latestUser } = latestUserBatch(context);
-  if (latestUser <= 0) return undefined;
+  const { start: latestUser, end } = latestUserBatch(context);
+  if (latestUser < 0) return undefined;
 
-  const entries: string[] = [];
-  for (const raw of context.messages.slice(0, latestUser)) {
-    if (raw.role === "system") continue;
-    const message = raw as {
-      role?: string;
-      toolName?: string;
-      content?: unknown;
-    };
-    const parts = Array.isArray(message.content) ? message.content : [];
-    const rendered: string[] =
-      typeof message.content === "string" && message.content.trim() ? [message.content] : [];
-    for (const part of parts as Array<Record<string, unknown>>) {
-      if (part?.type === "text" && typeof part.text === "string" && part.text.trim()) {
-        rendered.push(part.text);
-      } else if (part?.type === "toolCall" && typeof part.name === "string") {
-        const args = JSON.stringify(part.arguments ?? {});
-        rendered.push(`[tool call: ${part.name}${args === "{}" ? "" : ` ${args}`}]`);
+  const renderSlice = (slice: readonly TranscriptContext["messages"][number][]): string[] => {
+    const out: string[] = [];
+    for (const raw of slice) {
+      if (raw.role === "system") continue;
+      const message = raw as {
+        role?: string;
+        toolName?: string;
+        content?: unknown;
+      };
+      const parts = Array.isArray(message.content) ? message.content : [];
+      const rendered: string[] =
+        typeof message.content === "string" && message.content.trim() ? [message.content] : [];
+      for (const part of parts as Array<Record<string, unknown>>) {
+        if (part?.type === "text" && typeof part.text === "string" && part.text.trim()) {
+          rendered.push(part.text);
+        } else if (part?.type === "toolCall" && typeof part.name === "string") {
+          const args = JSON.stringify(part.arguments ?? {});
+          rendered.push(`[tool call: ${part.name}${args === "{}" ? "" : ` ${args}`}]`);
+        }
       }
+      if (rendered.length === 0) continue;
+      const role =
+        message.role === "toolResult"
+          ? `tool ${message.toolName ?? "result"}`
+          : (message.role ?? "message");
+      out.push(`${role}:\n${rendered.join("\n")}`);
     }
-    if (rendered.length === 0) continue;
-    const role =
-      message.role === "toolResult"
-        ? `tool ${message.toolName ?? "result"}`
-        : (message.role ?? "message");
-    entries.push(`${role}:\n${rendered.join("\n")}`);
-  }
+    return out;
+  };
+
+  const priorEntries = renderSlice(context.messages.slice(0, latestUser));
+  const inTurnEntries = renderSlice(context.messages.slice(end));
+  const entries =
+    inTurnEntries.length > 0
+      ? [...priorEntries, ...renderSlice(context.messages.slice(latestUser, end)), ...inTurnEntries]
+      : priorEntries;
   if (entries.length === 0) return undefined;
   const transcript = entries.join("\n\n");
   const bounded =
@@ -191,12 +203,14 @@ const OVERFLOW_PATTERN = /context (length|window|size).*(exceed|limit)|exceeds.*
  */
 const RECOVERED_INTERRUPTION_PATTERN = /stream was interrupted/i;
 
-/** Map an explicit pi thinking level to agy's `--effort` (low|medium|high). */
+/** Map an explicit pi thinking level to agy's `--effort` (low|medium|high|xhigh|max). */
 export function mapThinkingToEffort(level: ThinkingLevel | undefined): AgyEffort | undefined {
   if (level === undefined) return undefined;
   if (level === "low" || level === "minimal") return "low";
   if (level === "medium") return "medium";
-  return "high"; // high, xhigh, and max
+  if (level === "xhigh") return "xhigh";
+  if (level === "max") return "max";
+  return "high";
 }
 
 let replayCallSeq = 0;
@@ -250,7 +264,7 @@ export function streamAntigravity(
   /** Current discovery metadata used to resolve a valid required effort. */
   getModelInfo: (modelId: string) => AgyModelInfo | undefined = () => undefined,
   /** Validated process profile; read per turn so env changes recycle safely. */
-  getProcessProfile: () => AgyProcessProfile = readAgyProcessProfile,
+  getProcessProfile: (modelId?: string) => AgyProcessProfile = () => readAgyProcessProfile(),
   /** Combined bridge registration/catalog revision. */
   getBridgeRevision: () => string | undefined = () => undefined,
   /**
@@ -347,7 +361,7 @@ export function streamAntigravity(
           bridge.refreshTools();
           resolveBridgeResultsFromContext(bridge, context.messages);
           bridgeRevision = getBridgeRevision();
-          processProfile = getProcessProfile();
+          processProfile = getProcessProfile(model.id);
         }
         const requestedEffort = mapThinkingToEffort(options?.reasoning);
         const effort = resolveAgyModelEffort(getModelInfo(model.id), requestedEffort);
@@ -372,11 +386,13 @@ export function streamAntigravity(
             mode: processProfile.mode,
             mcpDirectory: processProfile.mcpDirectory,
             bridgeRevision,
+            hasPendingBridgeCalls: summaryRequest ? undefined : () => bridge.pendingCount > 0,
             signal: options?.signal,
           }),
         );
 
         let usage: AgyUsage | undefined;
+        let usageDurationSeconds: number | undefined;
         let textIndex: number | null = null;
         let textBuffer = "";
         /**
@@ -429,15 +445,18 @@ export function streamAntigravity(
           textBuffer = "";
         };
 
-        const attachUsage = (u: AgyUsage | undefined, final: boolean) => {
+        const attachUsage = (u: AgyUsage | undefined, final: boolean, durationSeconds?: number) => {
           if (summaryRequest) return; // summarization turns carry no billable usage
           output.usage = mapUsage(controller.claimUsage(u, final));
           calculateCost(model, output.usage);
+          if (durationSeconds !== undefined && durationSeconds > 0) {
+            output.durationMs = Math.round(durationSeconds * 1000);
+          }
         };
 
         const endWithToolUse = () => {
           closeText();
-          attachUsage(usage, false);
+          attachUsage(usage, false, usageDurationSeconds);
           output.stopReason = "toolUse";
           stream.push({ type: "done", reason: "toolUse", message: output });
           stream.end();
@@ -709,6 +728,9 @@ export function streamAntigravity(
             }
             case "usage": {
               usage = activity.usage;
+              if (activity.durationSeconds !== undefined) {
+                usageDurationSeconds = activity.durationSeconds;
+              }
               break;
             }
             case "thought": {
@@ -748,26 +770,36 @@ export function streamAntigravity(
               break;
             }
             case "bridge_call": {
-              // agy invoked a pi tool through the bridge: end this message
-              // with a toolUse for the REAL pi tool so pi executes it with
-              // full ownership (hooks, permissions, rendering, abort).
+              // agy invoked pi tool(s) through the bridge: coalesce any calls
+              // already queued in the same burst into one toolUse message so pi
+              // runs them in parallel with full ownership (hooks, permissions, abort).
               closeText();
               closePendingForBridge();
-              const toolCall = {
-                type: "toolCall" as const,
-                id: activity.id,
-                name: activity.name,
-                arguments: activity.args,
-              };
-              output.content.push(toolCall);
-              const index = output.content.length - 1;
-              stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
-              stream.push({
-                type: "toolcall_end",
-                contentIndex: index,
-                toolCall,
-                partial: output,
-              });
+              const extraCalls = controller.takeQueuedBridgeCalls();
+              for (const extra of extraCalls) {
+                try {
+                  if (!summaryRequest) onActivity?.(extra);
+                } catch {
+                  // UI side channels are best-effort and must never fail the turn.
+                }
+              }
+              for (const call of [activity, ...extraCalls]) {
+                const toolCall = {
+                  type: "toolCall" as const,
+                  id: call.id,
+                  name: call.name,
+                  arguments: call.args,
+                };
+                output.content.push(toolCall);
+                const index = output.content.length - 1;
+                stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+                stream.push({
+                  type: "toolcall_end",
+                  contentIndex: index,
+                  toolCall,
+                  partial: output,
+                });
+              }
               endWithToolUse();
               return;
             }
@@ -806,7 +838,7 @@ export function streamAntigravity(
               // latest response step — the actual model call represented by
               // this message — and use the cumulative result only when agy did
               // not expose a response-step usage event.
-              if (usage) attachUsage(usage, false);
+              if (usage) attachUsage(usage, false, usageDurationSeconds);
               else attachUsage(activity.usage, true);
 
               // Account for text rendered in earlier Pi messages and blocks,

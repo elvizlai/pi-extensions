@@ -26,8 +26,8 @@ import type { AgyToolMode } from "./tool-mode.ts";
 
 export const BRIDGE_SERVER_NAME = "pi-bridge";
 export const BRIDGE_TOOL_PREFIX = "pi__";
-/** Per-call cap; must stay below agy's 600s turn timeout so agy can still report the failure. */
-export const BRIDGE_CALL_TIMEOUT_MS = 480_000;
+/** Safety ceiling for one bridged Pi tool call; HTTP disconnect and agent_settled end dead calls immediately. */
+export const BRIDGE_CALL_TIMEOUT_MS = 1_800_000;
 
 export interface BridgeToolDef {
   /** Real pi tool name (without the `pi__` prefix). */
@@ -136,6 +136,7 @@ export class AgyPiBridge {
   #token: string | undefined;
   /** Unique descriptor-cache key; each agy process discovers its own private server. */
   readonly serverName: string;
+  readonly #callTimeoutMs: number;
   /** Callback that routes a call into the live agy turn controller. Returns false when no turn is active. */
   #onCall: ((call: BridgeCall) => boolean) | undefined;
   /** Source of the current active-tool snapshot, invoked once per provider request. */
@@ -145,8 +146,9 @@ export class AgyPiBridge {
   #catalogDigest = createHash("sha256").update("[]").digest("hex");
   #catalogRevision = 0;
 
-  constructor(serverName: string = BRIDGE_SERVER_NAME) {
+  constructor(serverName: string = BRIDGE_SERVER_NAME, callTimeoutMs = BRIDGE_CALL_TIMEOUT_MS) {
     this.serverName = serverName;
+    this.#callTimeoutMs = callTimeoutMs;
   }
 
   /** Require `token` in the x-pi-bridge-token header on every request. */
@@ -260,6 +262,7 @@ export class AgyPiBridge {
     this.#pending.clear();
     return new Promise((resolve) => {
       server.close(() => resolve());
+      server.closeIdleConnections?.();
     });
   }
 
@@ -294,20 +297,33 @@ export class AgyPiBridge {
       return;
     }
     const chunks: Buffer[] = [];
+    let aborted = false;
+    const disconnect = new AbortController();
+    res.once("close", () => {
+      if (!res.writableEnded) disconnect.abort();
+    });
+    req.on("error", () => {
+      aborted = true;
+      disconnect.abort();
+    });
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
+      if (aborted || disconnect.signal.aborted) return;
       let rpc: JsonRpcRequest;
       try {
         rpc = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as JsonRpcRequest;
       } catch {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" } }),
-        );
+        if (!res.writableEnded && !res.destroyed) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" } }),
+          );
+        }
         return;
       }
-      void this.#handleRpc(rpc).then(
+      void this.#handleRpc(rpc, disconnect.signal).then(
         (response) => {
+          if (res.writableEnded || res.destroyed) return;
           if (!response) {
             // Notification: no body per the streamable HTTP spec.
             res.writeHead(202);
@@ -321,6 +337,7 @@ export class AgyPiBridge {
           res.end(JSON.stringify(response));
         },
         () => {
+          if (res.writableEnded || res.destroyed) return;
           res.writeHead(500, { "content-type": "application/json" });
           res.end(
             JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" } }),
@@ -330,7 +347,10 @@ export class AgyPiBridge {
     });
   }
 
-  async #handleRpc(rpc: JsonRpcRequest): Promise<Record<string, unknown> | undefined> {
+  async #handleRpc(
+    rpc: JsonRpcRequest,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown> | undefined> {
     const base = { jsonrpc: "2.0", id: rpc.id ?? null };
     switch (rpc.method) {
       case "initialize": {
@@ -372,7 +392,7 @@ export class AgyPiBridge {
       case "tools/call": {
         const name = rpc.params?.name ?? "";
         const args = rpc.params?.arguments ?? {};
-        const result = await this.#routeCall(name, args);
+        const result = await this.#routeCall(name, args, signal);
         return {
           ...base,
           result: {
@@ -397,7 +417,11 @@ export class AgyPiBridge {
    * to execute it. Fails closed: no active turn, unknown tool, or timeout
    * all produce an isError result rather than hanging agy.
    */
-  async #routeCall(mcpName: string, args: JsonObject): Promise<BridgeCallResult> {
+  async #routeCall(
+    mcpName: string,
+    args: JsonObject,
+    signal?: AbortSignal,
+  ): Promise<BridgeCallResult> {
     if (!mcpName.startsWith(BRIDGE_TOOL_PREFIX)) {
       return {
         content: `antigravity: unknown tool "${mcpName}" — only ${BRIDGE_TOOL_PREFIX}* bridge tools exist.`,
@@ -408,12 +432,22 @@ export class AgyPiBridge {
     const dynamic = this.#dynamic.get(tool);
     if (dynamic) return dynamic.handler(args);
     if (this.#tools.some((def) => def.name === tool)) {
-      return this.#routeToPiTool(tool, args);
+      return this.#routeToPiTool(tool, args, signal);
     }
     return { content: `antigravity: tool "${tool}" is not currently active in pi.`, isError: true };
   }
 
-  async #routeToPiTool(tool: string, args: JsonObject): Promise<BridgeCallResult> {
+  async #routeToPiTool(
+    tool: string,
+    args: JsonObject,
+    signal?: AbortSignal,
+  ): Promise<BridgeCallResult> {
+    if (signal?.aborted) {
+      return {
+        content: `antigravity: client disconnected before pi tool "${tool}" started.`,
+        isError: true,
+      };
+    }
     const id = `pi-bridge-${++this.#seq}`;
     const dispatched = this.#onCall?.({ id, tool, args }) ?? false;
     if (!dispatched) {
@@ -423,20 +457,37 @@ export class AgyPiBridge {
       };
     }
     return new Promise<BridgeCallResult>((resolve) => {
+      const onDisconnect = () => {
+        const current = this.#pending.get(id);
+        if (!current) return;
+        this.#pending.delete(id);
+        clearTimeout(current.timer);
+        resolve({
+          content: `antigravity: client disconnected while pi tool "${tool}" was pending.`,
+          isError: true,
+        });
+      };
       const pending: PendingCall = {
         id,
         tool,
         args,
-        resolve,
+        resolve: (result) => {
+          signal?.removeEventListener("abort", onDisconnect);
+          resolve(result);
+        },
         timer: setTimeout(() => {
           this.#pending.delete(id);
+          signal?.removeEventListener("abort", onDisconnect);
           resolve({
-            content: `antigravity: pi tool "${tool}" did not return within ${Math.round(BRIDGE_CALL_TIMEOUT_MS / 1000)}s.`,
+            content: `antigravity: pi tool "${tool}" did not return within ${Math.round(this.#callTimeoutMs / 1000)}s.`,
             isError: true,
           });
-        }, BRIDGE_CALL_TIMEOUT_MS),
+        }, this.#callTimeoutMs),
       };
+      pending.timer.unref?.();
       this.#pending.set(id, pending);
+      signal?.addEventListener("abort", onDisconnect, { once: true });
+      if (signal?.aborted) onDisconnect();
     });
   }
 }

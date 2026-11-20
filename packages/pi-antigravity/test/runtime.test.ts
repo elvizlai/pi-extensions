@@ -729,3 +729,182 @@ test("runtime preserves bootstrapSuffix when first attempt fails non-stall befor
     await runtime.dispose();
   }
 });
+
+test("runtime mid-turn model switch replaces an open controller instead of re-attaching", async () => {
+  const requests: AgyTurnRequest[] = [];
+  const closes: Array<{ reason: string; cause?: string }> = [];
+  let releaseFirstTurn!: () => void;
+  const firstTurnParked = new Promise<void>((resolve) => {
+    releaseFirstTurn = resolve;
+  });
+
+  const executor: AgyTurnExecutor = {
+    async run(request) {
+      requests.push(request);
+      if (requests.length === 1) {
+        request.onConversation?.("conv-neon");
+        request.onActivity?.({
+          type: "bridge_call",
+          id: "pi-bridge-1",
+          name: "read",
+          args: { path: "a.ts" },
+        });
+        await firstTurnParked;
+        return completedOutcome("conv-neon");
+      }
+      request.onConversation?.("conv-carbon");
+      request.onActivity?.({ type: "text", delta: "carbon done" });
+      request.onActivity?.({
+        type: "result",
+        status: "OK",
+        response: "carbon done",
+        error: undefined,
+        usage: undefined,
+      });
+      return completedOutcome("conv-carbon");
+    },
+    snapshot: () => ({ mode: "persistent", state: "ready", lifecycle: [] }),
+    async close(reason, cause) {
+      closes.push({ reason, cause });
+      releaseFirstTurn();
+    },
+  };
+
+  const runtime = createAntigravityRuntime(executor);
+  const service = runtime.runSync(AntigravityRuntime);
+  try {
+    await runAntigravity(runtime, service.setSession("/repo", undefined, true));
+    const step1 = await runAntigravity(
+      runtime,
+      service.beginStreamTurn({
+        prompt: "inspect and fix",
+        modelId: "gemini-pro-orchestrator-neon",
+      }),
+    );
+    const callActivity = await step1.next();
+    assert.equal(callActivity?.type, "bridge_call");
+
+    // Step 2 re-enters with the SAME user prompt but a newly selected model.
+    const step2 = await runAntigravity(
+      runtime,
+      service.beginStreamTurn({
+        prompt: "inspect and fix",
+        historyBootstrap: "PRIOR + IN-TURN HISTORY",
+        bootstrapSuffix: "SKILLS",
+        modelId: "gemini-4-carbon",
+      }),
+    );
+    assert.notEqual(step2, step1);
+    assert.deepEqual(closes.at(-1), { reason: "recycle", cause: "model" });
+
+    const text = await step2.next();
+    assert.deepEqual(text, { type: "text", delta: "carbon done" });
+    assert.equal(requests[1]?.model, "gemini-4-carbon");
+    assert.equal(requests[1]?.conversationId, undefined);
+    assert.equal(requests[1]?.prompt, "PRIOR + IN-TURN HISTORY\n\ninspect and fix\n\nSKILLS");
+
+    // Normal completion followed by finishTurn leaves active cleared, so abandonTurn is a no-op.
+    const closesBeforeFinish = closes.length;
+    await runAntigravity(runtime, service.finishTurn);
+    await runAntigravity(runtime, service.abandonTurn);
+    assert.equal(closes.length, closesBeforeFinish);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("runtime abandonTurn aborts an orphaned toolUse turn when Pi settles without re-attaching", async () => {
+  const closes: Array<{ reason: string; cause?: string }> = [];
+  let releaseTurn!: () => void;
+  const parked = new Promise<void>((resolve) => {
+    releaseTurn = resolve;
+  });
+
+  const executor: AgyTurnExecutor = {
+    async run(request) {
+      request.onConversation?.("conv-orphan");
+      request.onActivity?.({
+        type: "bridge_call",
+        id: "pi-bridge-1",
+        name: "bash",
+        args: { command: "sleep 30" },
+      });
+      await parked;
+      return completedOutcome("conv-orphan");
+    },
+    snapshot: () => ({ mode: "persistent", state: "ready", lifecycle: [] }),
+    async close(reason, cause) {
+      closes.push({ reason, cause });
+      releaseTurn();
+    },
+  };
+
+  const runtime = createAntigravityRuntime(executor);
+  const service = runtime.runSync(AntigravityRuntime);
+  try {
+    const controller = await runAntigravity(
+      runtime,
+      service.beginStreamTurn({
+        prompt: "run command",
+        modelId: "gemini-pro-orchestrator-neon",
+      }),
+    );
+    const activity = await controller.next();
+    assert.equal(activity?.type, "bridge_call");
+
+    // Simulate Pi settling (e.g. Escape during tool execution or turn_end ending the run).
+    await runAntigravity(runtime, service.abandonTurn);
+    assert.deepEqual(closes.at(-1), { reason: "abort", cause: undefined });
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("runtime notifies executor activity when re-attaching after a bridged tool handoff", async () => {
+  let notifyCount = 0;
+  let releaseTurn!: () => void;
+  const parked = new Promise<void>((resolve) => {
+    releaseTurn = resolve;
+  });
+
+  const executor: AgyTurnExecutor = {
+    async run(request) {
+      request.onConversation?.("conv-reattach");
+      request.onActivity?.({
+        type: "bridge_call",
+        id: "pi-bridge-1",
+        name: "bash",
+        args: { command: "echo hi" },
+      });
+      await parked;
+      return completedOutcome("conv-reattach");
+    },
+    snapshot: () => ({ mode: "persistent", state: "running", lifecycle: [] }),
+    notifyActivity: () => {
+      notifyCount += 1;
+    },
+    async close() {
+      releaseTurn();
+    },
+  };
+
+  const runtime = createAntigravityRuntime(executor);
+  const service = runtime.runSync(AntigravityRuntime);
+  try {
+    const first = await runAntigravity(
+      runtime,
+      service.beginStreamTurn({ prompt: "run echo", modelId: "gemini-4-carbon" }),
+    );
+    assert.equal((await first.next())?.type, "bridge_call");
+    assert.equal(notifyCount, 0);
+
+    const reattached = await runAntigravity(
+      runtime,
+      service.beginStreamTurn({ prompt: "run echo", modelId: "gemini-4-carbon" }),
+    );
+    assert.equal(reattached, first);
+    assert.equal(notifyCount, 1);
+  } finally {
+    await runtime.dispose();
+  }
+});

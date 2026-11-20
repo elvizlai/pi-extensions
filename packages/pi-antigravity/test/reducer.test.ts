@@ -259,3 +259,24 @@ test("applyEvent streams activity events incrementally", () => {
   assert.deepEqual(seen, outcome.activities);
   assert.ok(seen.length > 0);
 });
+
+test("reducer forwards agent_response duration_seconds onto usage activities", () => {
+  const outcome = reduceAgyStream(
+    JSON.stringify({
+      event: "step_update",
+      step_update: {
+        step_index: 1,
+        state: "DONE",
+        step_type: "agent_response",
+        duration_seconds: 10.642,
+        usage: { input_tokens: 100, output_tokens: 50, thinking_tokens: 10, total_tokens: 150 },
+      },
+    }),
+  );
+  const usage = outcome.activities.find((a) => a.type === "usage");
+  assert.deepEqual(usage, {
+    type: "usage",
+    usage: { input_tokens: 100, output_tokens: 50, thinking_tokens: 10, total_tokens: 150 },
+    durationSeconds: 10.642,
+  });
+});

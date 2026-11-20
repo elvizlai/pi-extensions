@@ -12,13 +12,24 @@ export interface AgyModelInfo {
   defaultEffort?: AgyEffort;
 }
 
-const EFFORT_SUFFIX = /-(low|medium|high)$/i;
-const EFFORT_NAME_SUFFIX = /\s*\((?:low|medium|high)\)$/i;
+/** True for agy's two-phase Orchestrator models (`gemini-pro-orchestrator*`). */
+export function isAgyOrchestratorModel(modelId: string | undefined): boolean {
+  return typeof modelId === "string" && /(?:^|-)orchestrator(?:-|$)/i.test(modelId);
+}
+
+const EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high", "xhigh", "max"];
+const EFFORT_SET = new Set<string>(EFFORT_ORDER);
+const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/i;
+const EFFORT_NAME_SUFFIX = /\s*\((?:low|medium|high|xhigh|max)\)$/i;
+
+function isAgyEffort(value: unknown): value is AgyEffort {
+  return typeof value === "string" && EFFORT_SET.has(value);
+}
 
 function effortFromId(id: string): AgyEffort | undefined {
   const match = id.match(EFFORT_SUFFIX);
   const effort = match?.[1]?.toLowerCase();
-  return effort === "low" || effort === "medium" || effort === "high" ? effort : undefined;
+  return isAgyEffort(effort) ? effort : undefined;
 }
 
 /** Collapse one effort variant while retaining its discovered effort. */
@@ -40,10 +51,7 @@ export function mergeAgyModels(models: readonly AgyModelInfo[]): AgyModelInfo[] 
   for (const raw of models) {
     const normalized = normalizeAgyModelId(raw.id, raw.name);
     const efforts = raw.supportedEfforts?.length
-      ? raw.supportedEfforts.filter(
-          (effort): effort is AgyEffort =>
-            effort === "low" || effort === "medium" || effort === "high",
-        )
+      ? raw.supportedEfforts.filter(isAgyEffort)
       : normalized.supportedEfforts;
     const existing = merged.find((model) => model.id === normalized.id);
     if (!existing) {
@@ -78,13 +86,20 @@ export function parseAgyModels(text: string): AgyModelInfo[] {
   return mergeAgyModels(rows);
 }
 
-/** Resolve a valid effort for a normalized agy model. */
+/** Resolve a valid effort for a normalized agy model, clamping high requests downward before falling back. */
 export function resolveAgyModelEffort(
   model: AgyModelInfo | undefined,
   requested: AgyEffort | undefined,
 ): AgyEffort | undefined {
   if (!model || model.supportedEfforts.length === 0) return undefined;
-  if (requested && model.supportedEfforts.includes(requested)) return requested;
+  if (requested) {
+    if (model.supportedEfforts.includes(requested)) return requested;
+    const requestedRank = EFFORT_ORDER.indexOf(requested);
+    for (let i = requestedRank - 1; i >= 0; i -= 1) {
+      const lower = EFFORT_ORDER[i];
+      if (lower !== "low" && model.supportedEfforts.includes(lower)) return lower;
+    }
+  }
   return model.defaultEffort ?? model.supportedEfforts[0];
 }
 
@@ -186,9 +201,9 @@ export function capabilitiesForModel(modelId: string): ModelCapabilities {
   let maxTokens: number;
   if (/^gpt-oss-120b/i.test(modelId)) {
     maxTokens = 131_072;
-  } else if (/^claude-opus-4-6/i.test(modelId)) {
+  } else if (/^claude-opus-/i.test(modelId)) {
     maxTokens = 128_000;
-  } else if (/^claude-sonnet-4-6/i.test(modelId)) {
+  } else if (/^claude-sonnet-/i.test(modelId)) {
     maxTokens = 64_000;
   } else if (/^gemini-/i.test(modelId)) {
     maxTokens = 65_536;

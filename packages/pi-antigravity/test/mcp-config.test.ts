@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createPrivateMcpConfig } from "../lib/mcp-config.ts";
+import { createPrivateMcpConfig, sweepDeadBridgeArtifacts } from "../lib/mcp-config.ts";
 
 // The actual private workspace format is consumed by both native and Pi agy agents.
 test("private MCP configurations isolate credentials and clean up only their own directory", async (t) => {
@@ -53,4 +53,56 @@ test("failed private configuration writes can remove a partially created directo
   await assert.rejects(config.write("http://127.0.0.1:1234/mcp", "token"));
   await config.remove();
   assert.deepEqual(await readdir(root), []);
+});
+
+test("sweepDeadBridgeArtifacts removes dead-PID bridge, agent, and mcp cache artifacts while preserving live and foreign ones", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "agy-sweep-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bridgesRoot = path.join(root, "bridges");
+  const agentsRoot = path.join(root, "agents");
+  const mcpCacheRoot = path.join(root, "mcp");
+  await Promise.all([
+    mkdir(bridgesRoot, { recursive: true }),
+    mkdir(agentsRoot, { recursive: true }),
+    mkdir(mcpCacheRoot, { recursive: true }),
+  ]);
+
+  const deadUuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const liveUuid = "11111111-2222-3333-4444-555555555555";
+  const deadBridge = `999999-${deadUuid}`;
+  const liveBridge = `888888-${liveUuid}`;
+  const deadCache = "pi-aaaaaaaabbbb";
+  const liveCache = "pi-111111112222";
+  const deadAgent = `pi-tools-999999-${deadUuid}`;
+  const deadOrchAgent = `pi-tools-999999-${deadUuid}-orchestrator`;
+  const liveAgent = `pi-tools-888888-${liveUuid}`;
+  const liveOrchAgent = `pi-tools-888888-${liveUuid}-orchestrator`;
+
+  await Promise.all([
+    mkdir(path.join(bridgesRoot, deadBridge)),
+    mkdir(path.join(bridgesRoot, liveBridge)),
+    mkdir(path.join(bridgesRoot, "legacy-foreign")),
+    mkdir(path.join(mcpCacheRoot, deadCache)),
+    mkdir(path.join(mcpCacheRoot, liveCache)),
+    mkdir(path.join(mcpCacheRoot, "other-server")),
+    mkdir(path.join(agentsRoot, deadAgent)),
+    mkdir(path.join(agentsRoot, deadOrchAgent)),
+    mkdir(path.join(agentsRoot, liveAgent)),
+    mkdir(path.join(agentsRoot, liveOrchAgent)),
+    mkdir(path.join(agentsRoot, "custom-agent")),
+  ]);
+
+  await sweepDeadBridgeArtifacts({
+    bridgesRoot,
+    agentsRoot,
+    mcpCacheRoot,
+    isPidDead: (pid) => pid === 999999,
+  });
+
+  assert.deepEqual((await readdir(bridgesRoot)).sort(), ["legacy-foreign", liveBridge].sort());
+  assert.deepEqual((await readdir(mcpCacheRoot)).sort(), ["other-server", liveCache].sort());
+  assert.deepEqual(
+    (await readdir(agentsRoot)).sort(),
+    ["custom-agent", liveAgent, liveOrchAgent].sort(),
+  );
 });

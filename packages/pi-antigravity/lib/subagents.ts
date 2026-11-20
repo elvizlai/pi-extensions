@@ -37,6 +37,7 @@ const SPAWN_TOOLS = new Set([
   "run_subagent",
   "define_subagent",
   "browser_subagent",
+  "run_workflow",
 ]);
 const MESSAGE_TOOLS = new Set(["send_message"]);
 const MANAGE_TOOLS = new Set(["manage_subagents"]);

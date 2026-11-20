@@ -25,6 +25,7 @@ import { getDocsPath, getExamplesPath, getReadmePath } from "@earendil-works/pi-
 import { stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import path from "node:path";
 import { piConfigDir, readJson, writeJson } from "./lib/config.ts";
 import {
@@ -39,8 +40,8 @@ import { parseAgyAgents, readAgyProcessProfile } from "./lib/agy-profile.ts";
 import { createPiToolsAgent } from "./lib/pi-tools-agent.ts";
 import { readAgyToolMode, resolveAgyToolModeCommand, type AgyToolMode } from "./lib/tool-mode.ts";
 import { loadSavedAgyToolMode, saveAgyToolMode } from "./lib/tool-mode-settings.ts";
-import { removeMcpCacheEntry } from "./lib/mcp-cache.ts";
-import { createPrivateMcpConfig } from "./lib/mcp-config.ts";
+import { agyMcpCacheDir, removeMcpCacheEntry } from "./lib/mcp-cache.ts";
+import { createPrivateMcpConfig, sweepDeadBridgeArtifacts } from "./lib/mcp-config.ts";
 import { AgyPiBridge, selectBridgedTools, type PiToolInfo } from "./lib/bridge.ts";
 import { createBridgeLifecycleManager } from "./lib/bridge-lifecycle.ts";
 import {
@@ -237,9 +238,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   // Footer usage report: fetched in the background while an Antigravity
   // model is selected and folded into the antigravity status string.
   const USAGE_SUMMARY_TTL_MS = 5 * 60_000;
+  const USAGE_ERROR_BACKOFF_MS = 60_000;
   let usageReport: AgyUsageReport | undefined;
   let usageFetchInFlight = false;
-  let lastUsageFetchAt = 0;
+  let nextUsageFetchAt = 0;
 
   pi.registerEntryRenderer(AGY_COMPACTION_ENTRY, (entry, _options, theme) => {
     const marker = entry.data as AgyCompactionMarker;
@@ -298,16 +300,16 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   /** Fetch quotas in the background and fold the short summary into the footer. */
   async function refreshUsageSummary(ctx: ExtensionContext): Promise<void> {
-    if (usageFetchInFlight) return;
-    if (usageReport && Date.now() - lastUsageFetchAt < USAGE_SUMMARY_TTL_MS) return;
+    if (usageFetchInFlight || Date.now() < nextUsageFetchAt) return;
     const hasUI = probeCtx(() => ctx.hasUI);
     if (hasUI.stale || !hasUI.value) return;
     usageFetchInFlight = true;
     try {
       usageReport = await fetchAgyUsage();
-      lastUsageFetchAt = Date.now();
+      nextUsageFetchAt = Date.now() + USAGE_SUMMARY_TTL_MS;
     } catch {
       // Quota fetch is best-effort: keep showing the last known summary.
+      nextUsageFetchAt = Date.now() + USAGE_ERROR_BACKOFF_MS;
     } finally {
       usageFetchInFlight = false;
     }
@@ -416,6 +418,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         ui ? (warning) => ui.notify(warning, "warning") : undefined,
       );
     }
+    if (!bridgeManager.isRegistered()) {
+      await sweepDeadBridgeArtifacts();
+    }
+    process.off("exit", cleanupBridgeFilesSync);
+    process.once("exit", cleanupBridgeFilesSync);
     const registered = await bridgeManager.ensureRegistered((warning) =>
       ui?.notify(warning, "warning"),
     );
@@ -428,7 +435,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
   }
 
-  function getProcessProfile() {
+  function getProcessProfile(modelId?: string) {
     if (switchingToolMode) {
       throw new Error("antigravity: tool mode is changing; retry when the switch finishes.");
     }
@@ -440,18 +447,33 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     if (!bridgeManager.isRegistered() || !piToolsAgent.isPrepared()) {
       throw new Error("antigravity: Pi tool mode could not prepare its agent and bridge.");
     }
-    return { ...profile, agent: piToolsAgent.name };
+    return { ...profile, agent: piToolsAgent.nameForModel(modelId) };
   }
 
   /**
    * Remove this instance's private discovery and descriptor cache.
    * Runs when the session leaves Antigravity models and on shutdown.
    */
+  const cleanupBridgeFilesSync = () => {
+    for (const target of [
+      mcpConfig.directory,
+      ...piToolsAgent.directories,
+      path.join(agyMcpCacheDir(), mcpConfig.serverName),
+    ]) {
+      try {
+        rmSync(target, { recursive: true, force: true });
+      } catch {
+        // Best-effort process-exit fallback when session_shutdown never ran.
+      }
+    }
+  };
+
   async function teardownBridge(): Promise<void> {
     try {
       await bridgeManager.teardown();
     } finally {
       await piToolsAgent.remove();
+      process.off("exit", cleanupBridgeFilesSync);
     }
   }
 
@@ -822,13 +844,43 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     reconcileWidgetPolling();
   });
 
+  const modelKeyOf = (model: { provider: string; id: string } | undefined) =>
+    model ? `${model.provider}:${model.id}` : undefined;
+
+  async function reconcileModelSwitch(
+    nextModelKey: string | undefined,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    if (selectedModelKey?.startsWith("antigravity:") && selectedModelKey !== nextModelKey) {
+      const cwd = probeCtx(() => ctx.cwd);
+      const targetCwd = cwd.stale ? tasksSessionCwd : cwd.value;
+      if (targetCwd) {
+        await runAntigravity(runtime, service.setSession(targetCwd, undefined, true));
+      }
+      observedContextTokens = undefined;
+      persistedConversationKey = undefined;
+    }
+    selectedModelKey = nextModelKey;
+    if (!nextModelKey?.startsWith("antigravity:") && bridgeManager.isRegistered()) {
+      await teardownBridge();
+    }
+  }
+
+  pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
+    const next = probeCtx(() => modelKeyOf(ctx.model));
+    if (!next.stale) await reconcileModelSwitch(next.value, ctx);
+  });
+
   pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
+    await runAntigravity(runtime, service.abandonTurn).catch(() => {});
     const probe = probeCtx(() => ctx.model?.provider);
     if (!probe.stale && (probe.value === "antigravity" || agyAgentActive)) {
       agyAgentActive = false;
       updateAgyTasksWidget();
       if (probe.value === "antigravity") void refreshUsageSummary(ctx);
     }
+    const next = probeCtx(() => modelKeyOf(ctx.model));
+    if (!next.stale) await reconcileModelSwitch(next.value, ctx);
     await persistConversationState(ctx);
   });
 
@@ -854,7 +906,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (event, ctx: ExtensionContext) => {
     syncWrapperToolActivation(ctx.model?.provider);
     refreshToolModeStatus(ctx);
-    selectedModelKey = ctx.model ? `${ctx.model.provider}:${ctx.model.id}` : undefined;
+    selectedModelKey = modelKeyOf(ctx.model);
     const restored =
       event.reason !== "fork" && ctx.model?.provider === "antigravity"
         ? restorableAgyConversation(
@@ -911,27 +963,21 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.on("model_select", async (event, ctx) => {
     syncWrapperToolActivation(event.model?.provider);
     refreshToolModeStatus(ctx);
-    const nextModelKey = event.model ? `${event.model.provider}:${event.model.id}` : undefined;
-    if (selectedModelKey?.startsWith("antigravity:") && selectedModelKey !== nextModelKey) {
-      // Another provider/model can add context that the mutable agy
-      // conversation never saw. Force a branch bootstrap when agy is selected
-      // again instead of silently resuming stale native history.
-      const cwd = probeCtx(() => ctx.cwd);
-      if (!cwd.stale) {
-        await runAntigravity(runtime, service.setSession(cwd.value, undefined, true));
-        observedContextTokens = undefined;
-        persistedConversationKey = undefined;
-      }
+    const idle = probeCtx(() =>
+      typeof ctx.isIdle === "function" ? ctx.isIdle() : !agyAgentActive,
+    );
+    if (!idle.stale && idle.value) {
+      await reconcileModelSwitch(modelKeyOf(event.model), ctx);
     }
-    selectedModelKey = nextModelKey;
-    // The bridge exists only while an Antigravity model is selected.
     if (event.model?.provider === "antigravity") {
+      if (!idle.stale && !idle.value) {
+        agyAgentActive = true;
+        reconcileWidgetPolling();
+      }
       const ui = probeCtx(() => ctx?.ui);
       await ensureBridgeRegistered(ui.stale ? undefined : ui.value);
       await refreshStaleModelsWhenSelected();
       void refreshUsageSummary(ctx);
-    } else {
-      await teardownBridge();
     }
   });
 
@@ -1088,7 +1134,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       let profile = "agent: none · mode: default";
       try {
         const configured = readAgyProcessProfile();
-        const agent = getToolMode() === "pi" ? piToolsAgent.name : configured.agent;
+        const agent =
+          getToolMode() === "pi" ? piToolsAgent.nameForModel(ctx.model?.id) : configured.agent;
         profile = `agent: ${agent ?? "none"} · mode: ${configured.mode ?? "default"} · tools: ${getToolMode()}`;
       } catch (error) {
         profile = `profile error: ${error instanceof Error ? error.message : String(error)}`;
@@ -1324,7 +1371,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       let profile = "agent=none mode=default";
       try {
         const configured = readAgyProcessProfile();
-        const agent = getToolMode() === "pi" ? piToolsAgent.name : configured.agent;
+        const agent =
+          getToolMode() === "pi" ? piToolsAgent.nameForModel(ctx.model?.id) : configured.agent;
         profile = `agent=${agent ?? "none"} mode=${configured.mode ?? "default"} tools=${getToolMode()}`;
         lines.push(
           `selection: ${ctx.model?.id ?? "none"} · effort ${
@@ -1543,7 +1591,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       await openAgyUsagePicker(ctx, async (signal) => {
         const report = await fetchAgyUsage({ signal });
         usageReport = report;
-        lastUsageFetchAt = Date.now();
+        nextUsageFetchAt = Date.now() + USAGE_SUMMARY_TTL_MS;
         refreshToolModeStatus(ctx);
         return report;
       });

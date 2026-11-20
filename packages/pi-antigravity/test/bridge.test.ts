@@ -719,3 +719,49 @@ test("createBridgeLifecycleManager respects disabled setting", async () => {
   fresh.warnSkillsUnavailable([]);
   assert.equal(warnings.length, 1);
 });
+
+test("bridge evicts pending call immediately when the HTTP client disconnects", async () => {
+  const bridge = new AgyPiBridge("pi-disconnect-test", 60_000);
+  let callId: string | undefined;
+  bridge.setOnCall((call) => {
+    callId = call.id;
+    return true;
+  });
+  bridge.setToolSource(() => TOOL_DEFS);
+  await bridge.start();
+  try {
+    bridge.refreshTools();
+    const ac = new AbortController();
+    const postPromise = fetch(bridge.url!, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 99,
+        method: "tools/call",
+        params: { name: `${BRIDGE_TOOL_PREFIX}commit`, arguments: {} },
+      }),
+      signal: ac.signal,
+    }).catch(() => undefined);
+
+    const waitPending = Date.now() + 5_000;
+    while (bridge.pendingCount < 1 && Date.now() < waitPending) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(bridge.pendingCount, 1);
+    assert.ok(callId && bridge.isAwaiting(callId));
+
+    // Simulate agy process killed / HTTP socket aborted mid-call.
+    ac.abort();
+    await postPromise;
+
+    const waitCleared = Date.now() + 5_000;
+    while (bridge.pendingCount > 0 && Date.now() < waitCleared) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(bridge.pendingCount, 0);
+    assert.equal(bridge.isAwaiting(callId!), false);
+  } finally {
+    await bridge.close();
+  }
+});

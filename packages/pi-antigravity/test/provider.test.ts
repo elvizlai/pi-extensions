@@ -224,8 +224,8 @@ test("mapThinkingToEffort maps pi thinking levels to agy effort", () => {
   assert.equal(mapThinkingToEffort("low"), "low");
   assert.equal(mapThinkingToEffort("medium"), "medium");
   assert.equal(mapThinkingToEffort("high"), "high");
-  assert.equal(mapThinkingToEffort("xhigh"), "high");
-  assert.equal(mapThinkingToEffort("max"), "high");
+  assert.equal(mapThinkingToEffort("xhigh"), "xhigh");
+  assert.equal(mapThinkingToEffort("max"), "max");
 });
 
 test("agyIncompleteToolError explains agy background tasks for run_command", () => {
@@ -1195,4 +1195,236 @@ test("streamAntigravity renders a stall/retry as a thinking marker before the an
   assert.equal(text.text, "recovered answer");
   // The marker must be delta-replay legal (append-only indices).
   assertDeltasMatchPartial(events);
+});
+
+test("streamAntigravity coalesces concurrent bridge_call bursts into a single toolUse message", async () => {
+  const { controller, collect } = makeStreamHarness();
+  const eventsPromise = collect();
+  controller.push({
+    type: "bridge_call",
+    id: "pi-bridge-1",
+    name: "read",
+    args: { path: "a.ts" },
+  });
+  controller.push({
+    type: "bridge_call",
+    id: "pi-bridge-2",
+    name: "read",
+    args: { path: "b.ts" },
+  });
+
+  const events = await eventsPromise;
+  const done = events.find((event) => event.type === "done");
+  assert.ok(done);
+  assert.equal(done.reason, "toolUse");
+  const toolCalls = done.message.content.filter((block: any) => block.type === "toolCall");
+  assert.deepEqual(
+    toolCalls.map((c: any) => ({ id: c.id, name: c.name })),
+    [
+      { id: "pi-bridge-1", name: "read" },
+      { id: "pi-bridge-2", name: "read" },
+    ],
+  );
+  assertDeltasMatchPartial(events);
+});
+
+test("streamAntigravity propagates usage.durationSeconds into durationMs on toolUse and stop turns", async () => {
+  // 1. toolUse (bridge_call) turn uses step duration_seconds
+  {
+    const { controller, collect } = makeStreamHarness();
+    const eventsPromise = collect();
+    controller.push({
+      type: "usage",
+      usage: { input_tokens: 1_000, output_tokens: 450, thinking_tokens: 300, total_tokens: 1_450 },
+      durationSeconds: 10.642,
+    });
+    controller.push({
+      type: "bridge_call",
+      id: "pi-bridge-dur-1",
+      name: "read",
+      args: { path: "a.ts" },
+    });
+    const events = await eventsPromise;
+    const done = events.find((event) => event.type === "done");
+    assert.equal(done?.reason, "toolUse");
+    assert.equal(done?.message.durationMs, 10_642);
+  }
+
+  // 2. final stop turn uses step duration_seconds
+  {
+    const { controller, collect } = makeStreamHarness();
+    const eventsPromise = collect();
+    controller.push({
+      type: "usage",
+      usage: { input_tokens: 2_000, output_tokens: 800, thinking_tokens: 200, total_tokens: 2_800 },
+      durationSeconds: 6.25,
+    });
+    controller.push({ type: "text", delta: "ok" });
+    controller.push({
+      type: "result",
+      status: "OK",
+      response: "ok",
+      error: undefined,
+      usage: undefined,
+    });
+    const events = await eventsPromise;
+    const done = events.find((event) => event.type === "done");
+    assert.equal(done?.reason, "stop");
+    assert.equal(done?.message.durationMs, 6_250);
+  }
+
+  // 3. omits durationMs override when durationSeconds is absent (stream clock fallback)
+  {
+    const { controller, collect } = makeStreamHarness();
+    const eventsPromise = collect();
+    controller.push({
+      type: "usage",
+      usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 },
+    });
+    controller.push({ type: "text", delta: "hi" });
+    controller.push({
+      type: "result",
+      status: "OK",
+      response: "hi",
+      error: undefined,
+      usage: undefined,
+    });
+    const events = await eventsPromise;
+    const done = events.find((event) => event.type === "done");
+    assert.equal(done?.reason, "stop");
+    assert.equal(typeof done?.message.durationMs, "number");
+    assert.ok(done?.message.durationMs >= 0 && done?.message.durationMs < 5_000);
+  }
+});
+
+test("piHistoryBootstrap includes completed in-turn steps when starting fresh mid-turn", () => {
+  assert.equal(
+    piHistoryBootstrap(
+      contextWith([{ role: "user", content: [{ type: "text", text: "Fresh request" }] }]),
+    ),
+    undefined,
+  );
+
+  const midTurnCtx = contextWith([
+    { role: "user", content: [{ type: "text", text: "x".repeat(70_000) }] },
+    { role: "assistant", content: [{ type: "text", text: "earlier reply" }] },
+    { role: "user", content: [{ type: "text", text: "Switch mid-turn" }] },
+    {
+      role: "assistant",
+      content: [{ type: "toolCall", name: "bash", arguments: { command: "git status" } }],
+    },
+    {
+      role: "toolResult",
+      toolName: "bash",
+      content: [{ type: "text", text: `M index.ts\n${"y".repeat(20_000)}` }],
+    },
+  ]);
+
+  const history = piHistoryBootstrap(midTurnCtx);
+  assert.ok(history);
+  assert.match(history, /Switch mid-turn/);
+  assert.match(history, /tool call: bash/);
+  assert.match(history, /M index\.ts/);
+  assert.ok(history.length < 82_000);
+});
+
+test("streamAntigravity passes model.id to getProcessProfile and keeps summaries on getSummaryProcessProfile", async () => {
+  const seenModels: Array<string | undefined> = [];
+  let summaryCalls = 0;
+  const prompt = "normal request";
+  const controller = new AgyTurnController(prompt);
+  const summaryPrompt = "<conversation>\nuser: hi\n</conversation>\n\nSummarize.";
+  const summaryController = new AgyTurnController(summaryPrompt);
+  const requests: Array<{ prompt: string; agent?: string }> = [];
+  const makeFakeService = (ctrl: AgyTurnController) => ({
+    beginStreamTurn: (input: { prompt: string; agent?: string }) =>
+      Effect.sync(() => {
+        requests.push({ prompt: input.prompt, agent: input.agent });
+        return ctrl;
+      }),
+    finishTurn: Effect.void,
+    snapshot: Effect.succeed({ cwd: "/repo" }),
+    setSession: () => Effect.void,
+    close: Effect.void,
+    dispose: () => Promise.resolve(),
+  });
+  const mainRuntime = {
+    runPromise: (effect: Effect.Effect<any, any>) => Effect.runPromise(effect),
+  };
+  const summaryRuntime = {
+    runSync: () => makeFakeService(summaryController),
+    runPromise: (effect: Effect.Effect<any, any>) => Effect.runPromise(effect),
+    dispose: () => Promise.resolve(),
+  };
+  const streamFn = streamAntigravity(
+    mainRuntime as any,
+    makeFakeService(controller) as any,
+    new AgyReplayStore(),
+    new AgyPiBridge("test-profile-bridge"),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    () => summaryRuntime as any,
+    undefined,
+    (modelId) => {
+      seenModels.push(modelId);
+      return {
+        agent: modelId?.includes("orchestrator") ? "pi-tools-orch" : "pi-tools-std",
+      };
+    },
+    undefined,
+    undefined,
+    () => {
+      summaryCalls += 1;
+      return { agent: "pi-tools-std" };
+    },
+  );
+  const orchestratorModel = {
+    id: "gemini-pro-orchestrator",
+    provider: "antigravity",
+    api: "antigravity-stream-json",
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  } as any;
+
+  const mainDone = (async () => {
+    for await (const _ of streamFn(
+      orchestratorModel,
+      contextWith([{ role: "user", content: [{ type: "text", text: prompt }] }]),
+    )) {
+      // drain
+    }
+  })();
+  controller.push({
+    type: "result",
+    status: "OK",
+    response: "ok",
+    error: undefined,
+    usage: undefined,
+  });
+  await mainDone;
+
+  const summaryDone = (async () => {
+    for await (const _ of streamFn(
+      orchestratorModel,
+      contextWith([{ role: "user", content: [{ type: "text", text: summaryPrompt }] }]),
+    )) {
+      // drain
+    }
+  })();
+  summaryController.push({
+    type: "result",
+    status: "OK",
+    response: "summary",
+    error: undefined,
+    usage: undefined,
+  });
+  await summaryDone;
+
+  assert.deepEqual(seenModels, ["gemini-pro-orchestrator"]);
+  assert.equal(summaryCalls, 1);
+  assert.deepEqual(
+    requests.map((r) => r.agent),
+    ["pi-tools-orch", "pi-tools-std"],
+  );
 });

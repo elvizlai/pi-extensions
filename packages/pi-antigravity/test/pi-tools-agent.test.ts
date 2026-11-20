@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { createPiToolsAgent } from "../lib/pi-tools-agent.ts";
+import { createPiToolsAgent, PI_TOOLS_ORCHESTRATOR_TOOLS } from "../lib/pi-tools-agent.ts";
 import { readAgyToolMode, resolveAgyToolModeCommand } from "../lib/tool-mode.ts";
 
 test("tool mode defaults to native and the startup flag overrides the environment", () => {
@@ -30,13 +30,18 @@ test("slash command toggles or resolves explicit on/off/status without accepting
   }
 });
 
-test("Pi tool agent scopes MCP to its bridge and removes only its own configuration", async (t) => {
+test("Pi tool agent prepares standard and orchestrator variants and removes only its own configuration", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "agy-pi-tools-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(path.join(root, "existing-agent.md"), "keep");
   const agent = createPiToolsAgent(root);
   const other = createPiToolsAgent(root);
   assert.notEqual(agent.name, other.name);
+  assert.notEqual(agent.orchestratorName, agent.name);
+  assert.equal(agent.nameForModel("gemini-4-carbon"), agent.name);
+  assert.equal(agent.nameForModel(undefined), agent.name);
+  assert.equal(agent.nameForModel("gemini-pro-orchestrator"), agent.orchestratorName);
+  assert.equal(agent.nameForModel("gemini-pro-orchestrator-neon"), agent.orchestratorName);
   assert.equal(agent.isPrepared(), false);
   const bridge = {
     serverName: "pi-bridge-123",
@@ -45,23 +50,33 @@ test("Pi tool agent scopes MCP to its bridge and removes only its own configurat
   };
   await agent.prepare(bridge);
   assert.equal(agent.isPrepared(), true);
-  const agentFile = path.join(root, agent.name, "agent.md");
-  const definition = JSON.parse((await readFile(agentFile, "utf8")).split("---\n")[1]);
-  assert.deepEqual(definition.tools, []);
-  assert.equal(definition.mainAgent, true);
-  assert.equal(definition.inheritCustomizations, false);
-  assert.deepEqual(definition.mcpServers, [
-    {
-      name: bridge.serverName,
-      serverUrl: bridge.url,
-      headers: { "x-pi-bridge-token": bridge.token },
-    },
-  ]);
-  if (process.platform !== "win32") {
-    assert.equal((await stat(agentFile)).mode & 0o777, 0o600);
+
+  for (const [agentName, expectedTools] of [
+    [agent.name, []],
+    [agent.orchestratorName, [...PI_TOOLS_ORCHESTRATOR_TOOLS]],
+  ] as const) {
+    const agentFile = path.join(root, agentName, "agent.md");
+    const definition = JSON.parse((await readFile(agentFile, "utf8")).split("---\n")[1]);
+    assert.equal(definition.name, agentName);
+    assert.deepEqual(definition.tools, expectedTools);
+    assert.equal(definition.hidden, true);
+    assert.equal(definition.mainAgent, true);
+    assert.equal(definition.inheritCustomizations, false);
+    assert.deepEqual(definition.mcpServers, [
+      {
+        name: bridge.serverName,
+        serverUrl: bridge.url,
+        headers: { "x-pi-bridge-token": bridge.token },
+      },
+    ]);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(agentFile)).mode & 0o777, 0o600);
+    }
   }
+
   await agent.prepare({ ...bridge, url: "http://127.0.0.1:5678/mcp" });
-  assert.match(await readFile(agentFile, "utf8"), /5678/);
+  assert.match(await readFile(path.join(root, agent.name, "agent.md"), "utf8"), /5678/);
+  assert.match(await readFile(path.join(root, agent.orchestratorName, "agent.md"), "utf8"), /5678/);
   await agent.remove();
   await agent.remove();
   assert.equal(agent.isPrepared(), false);

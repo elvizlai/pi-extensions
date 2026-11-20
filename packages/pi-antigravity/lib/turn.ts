@@ -69,6 +69,18 @@ export class AgyTurnController {
     return tools;
   }
 
+  /** Drain additional bridge_call activities already queued from the same burst. */
+  takeQueuedBridgeCalls(): Array<Extract<AgyActivity, { type: "bridge_call" }>> {
+    const calls: Array<Extract<AgyActivity, { type: "bridge_call" }>> = [];
+    const rest: AgyActivity[] = [];
+    for (const item of this.#queue) {
+      if (item.type === "bridge_call") calls.push(item);
+      else rest.push(item);
+    }
+    this.#queue = rest;
+    return calls;
+  }
+
   /** Keep the terminal result pending while Pi executes incomplete-tool replay.
    * Unlike push(), this also works after the executor has closed the turn.
    */

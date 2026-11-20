@@ -1991,3 +1991,52 @@ test("non-daemon backgrounded commands do not park early on transitional transcr
     await rm(fixture.dir, { recursive: true, force: true });
   }
 });
+
+test("driver does not stall or consume finite graces while Pi owns pending bridged tool calls", async () => {
+  const fixture = await driverFixture();
+  const executor = new AgyDriverSession();
+  // Even with 0 child process liveness graces, pending bridge calls in Pi must keep agy alive!
+  executor.setStallLivenessProbe(async () => false, 0);
+  let child: ReturnType<typeof spawn> | undefined;
+  let bridgePending = true;
+  let livenessRefreshes = 0;
+
+  try {
+    const runPromise = executor.run({
+      prompt: "tool-silent",
+      binary: fixture.script,
+      cwd: fixture.dir,
+      inactivityTimeoutMs: 30,
+      toolInactivityTimeoutMs: 30,
+      parkedWatchMs: 0,
+      timeoutMs: 5_000,
+      hasPendingBridgeCalls: () => bridgePending,
+      onLiveness: () => {
+        livenessRefreshes += 1;
+      },
+      spawnOverride: ((
+        _binary: string,
+        args: readonly string[],
+        options: Parameters<typeof spawn>[2],
+      ) => {
+        child = spawn(process.execPath, [fixture.script, ...args], options);
+        return child;
+      }) as typeof spawn,
+    });
+
+    // Wait across multiple 30ms stall budgets while Pi "executes" the bridged tool.
+    await new Promise((r) => setTimeout(r, 110));
+    assert.ok(livenessRefreshes >= 3, `expected liveness refreshes, got ${livenessRefreshes}`);
+
+    bridgePending = false;
+    child?.stdin?.write(
+      `${JSON.stringify({ event: "user", message: { content: "finish-late-result" } })}\n`,
+    );
+    const outcome = await runPromise;
+    assert.equal(outcome.status, "OK");
+    assert.equal(outcome.response, "late answer");
+  } finally {
+    await executor.close("shutdown");
+    await rm(fixture.dir, { recursive: true, force: true });
+  }
+});

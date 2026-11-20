@@ -84,6 +84,7 @@ export interface AgyTurnExecutor {
   run(request: AgyTurnRequest): Promise<AgyTurnOutcome>;
   snapshot(): AgyExecutorSnapshot;
   close(reason: AgyExecutorCloseReason, cause?: AgyRecycleCause): Promise<void>;
+  notifyActivity?(): void;
 }
 
 interface ActiveTurn {
@@ -98,6 +99,8 @@ interface ActiveTurn {
   stallTimer?: NodeJS.Timeout;
   /** Stall budgets already forgiven because a tool process was verifiably alive. */
   stallGraces: number;
+  /** True while Pi owns execution of bridged MCP tool call(s). */
+  waitingOnBridge: boolean;
   /** Parked-turn checks already consumed (see #onStallExpired). */
   parkedChecks: number;
   /**
@@ -329,6 +332,10 @@ export class AgyDriverSession implements AgyTurnExecutor {
     }
   }
 
+  notifyActivity(): void {
+    if (this.#active) this.#rearmStall(this.#active);
+  }
+
   async close(reason: AgyExecutorCloseReason, cause?: AgyRecycleCause): Promise<void> {
     if (reason === "shutdown") this.#shutdown = true;
     await this.#recycling;
@@ -486,6 +493,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
       conversationReported: false,
       deadlineAt: performance.now() + (request.timeoutMs ?? 600_000),
       stallGraces: 0,
+      waitingOnBridge: false,
       parkedChecks: 0,
       parkedOnBackgroundWork: false,
       parkedWatchMs: request.parkedWatchMs ?? this.#parkedWatchMs,
@@ -625,7 +633,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
   }
 
   #stallBudgetMs(turn: ActiveTurn): number {
-    const baseMs = turn.request.inactivityTimeoutMs ?? 120_000;
+    const baseMs = turn.request.inactivityTimeoutMs ?? 300_000;
     if (baseMs <= 0) return 0;
     return turn.activeTools.size > 0
       ? (turn.request.toolInactivityTimeoutMs ?? Math.max(baseMs, 300_000))
@@ -638,6 +646,8 @@ export class AgyDriverSession implements AgyTurnExecutor {
     // Any rearm invalidates an in-flight liveness probe: its answer describes
     // a window that new stream activity has already superseded.
     turn.stallEpoch += 1;
+    turn.silenceMs = 0;
+    turn.waitingOnBridge = false;
     this.#refreshOverallDeadline(turn);
     const budgetMs = this.#stallBudgetMs(turn);
     if (budgetMs <= 0) {
@@ -757,6 +767,25 @@ export class AgyDriverSession implements AgyTurnExecutor {
   ): Promise<void> {
     const child = this.#child;
     if (this.#active !== turn || !child || turn.stallEpoch !== epoch) return;
+
+    if (
+      child.pid !== undefined &&
+      (turn.request.hasPendingBridgeCalls?.() || turn.waitingOnBridge)
+    ) {
+      const pending = Boolean(turn.request.hasPendingBridgeCalls?.());
+      turn.waitingOnBridge = pending;
+      if (pending) this.#log("stall:bridge-pending");
+      turn.silenceMs = 0;
+      this.#refreshOverallDeadline(turn);
+      const nextBudgetMs = this.#stallBudgetMs(turn);
+      if (turn.stallTimer) clearTimeout(turn.stallTimer);
+      turn.stallTimer = setTimeout(
+        () => void this.#onStallExpired(turn, nextBudgetMs, epoch),
+        nextBudgetMs,
+      );
+      return;
+    }
+
     turn.silenceMs += budgetMs;
     const toolActive = turn.activeTools.size > 0;
 

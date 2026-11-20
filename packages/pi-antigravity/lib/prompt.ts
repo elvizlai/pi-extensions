@@ -177,7 +177,7 @@ export function restoredPiContextPrompt(transcript: string): string {
   return [
     "## Restored pi conversation context",
     "",
-    "This fresh agy conversation is continuing the active pi history, including any work with another provider, session resume, fork, or branch move. Treat the transcript below as prior conversation context, then answer the current user request that follows it.",
+    "This fresh agy conversation is continuing the active pi history, including any work with another provider, session resume, fork, or branch move. Treat the transcript below as prior conversation context (including any tool calls and results already completed in this turn), then answer the current user request that follows it.",
     "",
     transcript,
     "",

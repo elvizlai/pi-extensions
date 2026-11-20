@@ -170,6 +170,16 @@ export function formatAgyCall(tool: string, input: unknown, theme: Theme): strin
       const taskText = task === undefined ? "" : theme.fg("accent", ` ${task}`);
       return `${label} ${actionText}${taskText}`;
     }
+    case "exit_plan_mode":
+    case "enter_plan_mode": {
+      const summary = pickArg(args, ["reason", "Reason", "plan", "Plan"])
+        ?.split("\n")
+        .map((line) => line.replace(/^#+\s*/, "").trim())
+        .find(Boolean);
+      if (!summary) return label;
+      const clipped = summary.length > 72 ? `${summary.slice(0, 71)}…` : summary;
+      return `${label} ${theme.fg("accent", `"${clipped}"`)}`;
+    }
     default: {
       const generic = formatGenericArgs(args, theme);
       return generic ? `${label} ${generic}` : label;

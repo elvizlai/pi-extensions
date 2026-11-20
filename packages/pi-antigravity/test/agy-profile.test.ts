@@ -26,7 +26,9 @@ test("readAgyProcessProfile validates agent and execution mode", () => {
 test("parseAgyAgents tolerates empty, tabular, and bullet output", () => {
   assert.deepEqual(parseAgyAgents(""), []);
   assert.deepEqual(
-    parseAgyAgents("Available agents:\nreviewer  Reviews code\n- planner\nreviewer\tduplicate"),
+    parseAgyAgents(
+      "Available agents:\nreviewer  Reviews code\npi-tools-9056-2f03257d-cd13-4db5-95a7-6b77e58948b1\npi-tools-9056-2f03257d-cd13-4db5-95a7-6b77e58948b1-orchestrator\n- planner\nreviewer\tduplicate",
+    ),
     ["reviewer", "planner"],
   );
 });

@@ -52,6 +52,7 @@ export function parseAgyAgents(text: string): string[] {
       ?.replace(/^[-*]\s*/, "")
       .trim();
     if (!name || name.length > MAX_AGENT_NAME_LENGTH || /[\x00-\x1f\x7f]/.test(name)) continue;
+    if (/^pi-tools-\d+-[0-9a-f-]+(?:-orchestrator)?$/i.test(name)) continue;
     if (!agents.includes(name)) agents.push(name);
   }
   return agents;

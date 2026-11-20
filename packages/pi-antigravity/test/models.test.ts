@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   capabilitiesForModel,
   FALLBACK_MODELS,
+  isAgyOrchestratorModel,
   modelCacheIsFresh,
   modelCacheTtlMs,
   parseAgyModels,
@@ -10,6 +11,15 @@ import {
   resolveAgyModelEffort,
 } from "../lib/models.ts";
 import { MODELS_OUTPUT } from "./fixtures.ts";
+
+test("isAgyOrchestratorModel identifies orchestrator models only", () => {
+  assert.equal(isAgyOrchestratorModel("gemini-pro-orchestrator"), true);
+  assert.equal(isAgyOrchestratorModel("gemini-pro-orchestrator-neon"), true);
+  assert.equal(isAgyOrchestratorModel("gemini-pro-orchestrator-argon"), true);
+  assert.equal(isAgyOrchestratorModel("gemini-4-carbon"), false);
+  assert.equal(isAgyOrchestratorModel("claude-opus-5-5"), false);
+  assert.equal(isAgyOrchestratorModel(undefined), false);
+});
 
 test("parseAgyModels parses tab-separated model lines, collapses effort variants, and skips noise", () => {
   const models = parseAgyModels(MODELS_OUTPUT);
@@ -50,6 +60,34 @@ test("parseAgyModels dedupes ids and rejects malformed lines", () => {
 
 test("parseAgyModels returns empty for empty output", () => {
   assert.deepEqual(parseAgyModels(""), []);
+});
+
+test("parseAgyModels collapses xhigh/max variants and preserves orchestrator ids", () => {
+  const parsed = parseAgyModels(
+    [
+      "gemini-4-neon-high\tGemini 4 Neon (High)",
+      "gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)",
+      "gemini-4-neon-medium\tGemini 4 Neon (Medium)",
+      "gemini-4-neon-low\tGemini 4 Neon (Low)",
+      "gemini-4-carbon-medium\tGemini 4 Carbon (Medium)",
+      "gemini-4-carbon-high\tGemini 4 Carbon (High)",
+      "gemini-4-carbon-low\tGemini 4 Carbon (Low)",
+      "gemini-pro-orchestrator-neon\tOrchestrator (Neon)",
+      "gemini-pro-orchestrator\tOrchestrator (Carbon)",
+    ].join("\n"),
+  );
+  assert.deepEqual(
+    parsed.map((m) => m.id),
+    ["gemini-4-neon", "gemini-4-carbon", "gemini-pro-orchestrator-neon", "gemini-pro-orchestrator"],
+  );
+  assert.deepEqual(parsed[0].supportedEfforts, ["high", "xhigh", "medium", "low"]);
+  assert.equal(parsed[0].name, "Gemini 4 Neon");
+  assert.equal(resolveAgyModelEffort(parsed[0], "xhigh"), "xhigh");
+  // Carbon's default is medium, so xhigh/max clamps down to high instead of dropping to medium.
+  assert.equal(resolveAgyModelEffort(parsed[1], "xhigh"), "high");
+  assert.equal(resolveAgyModelEffort(parsed[1], "max"), "high");
+  // Orchestrator manages its own Planner/Worker efforts.
+  assert.equal(resolveAgyModelEffort(parsed[2], "high"), undefined);
 });
 
 test("resolveAgyModelEffort never launches a normalized model with an invalid effort", () => {
@@ -94,6 +132,10 @@ test("capabilitiesForModel gives agy ownership with a 1M Pi scheduling window", 
     maxTokens: 64_000,
   });
   assert.deepEqual(capabilitiesForModel("claude-opus-4-6-thinking"), {
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+  });
+  assert.deepEqual(capabilitiesForModel("claude-opus-5-5"), {
     contextWindow: 1_000_000,
     maxTokens: 128_000,
   });
